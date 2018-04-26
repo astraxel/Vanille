@@ -100,10 +100,7 @@ module Th: S = struct
     |Compute p -> Compute ( fun () ->
                             bind (p ()) e2
                           )
-
-  (*let step = function
-    |End v -> v
-    |Compute p -> p ()*)
+                
 
   let rec run = function
     |End v -> v

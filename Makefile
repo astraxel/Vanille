@@ -6,6 +6,7 @@ TARGET=native
 example:
 	$(OCAMLBUILD) example.$(TARGET)
 	$(OCAMLBUILD) exampleUnix.$(TARGET)
+	$(OCAMLBUILD) exampleSeq.$(TARGET)
 
 
 clean:
