@@ -57,12 +57,16 @@ module Th: S = struct
             
   type 'a process = { proc : (unit -> 'a);
                       flags : flag list;
+                      id : int;
                     }
                     (* Chaque process aura un unique moyen pour communiquer avec le processus
                        principal de la machine qui s'occupe de la communication avec le serveur.
                        Aucun input/output n'est crée si le process n'est pas encore affecté
                        ou si le flag NO_COMMUNICATION est spécifié.
                        Cf variables globales input et output.
+
+                       Pour gérer les questions de doco, chaque processus aura un id. 
+                       Il est à -1 initialement, et est modifié par le serveur
                      *)
 
 
@@ -84,14 +88,15 @@ module Th: S = struct
                  }
 
   type 'a communication = DC_QUERY
-                        | DC_CONFIRM (*Sent when the client has no active process anymore*)
+                        | DC_CONFIRM (*Quand le client n'a plus de processus actifs*)
                         | CHANNEL_QUERY
                         | CHANNEL of int
                         | DATA of 'a data
                         | DATA_REQUEST of 'a port
                         | DOCO of unit process list
+                        | DOCO_CONFIRM of int (*Message du serveur à un processus signalant que les processus parallèles sont terminés*)
                         | EXECUTE of 'a process
-                        | RESULT of 'a
+                        | RESULT of 'a data (*ici, le target est le numéro du processus envoyant le résultat*)
                            
                                 
 
@@ -117,7 +122,7 @@ module Th: S = struct
 
   (* FONCTIONS CLIENT *)               
              
-  (*Communication client/process ->  FAIT : changer les protocoles de communication de in_channel et out_channel vers bytes*)
+  (*Fonctions de lecture et d'écriture*)
                  
   let send_data comm =
     match (!output) with
@@ -155,28 +160,31 @@ module Th: S = struct
     |None -> failwith "No communications are enabled for this process"
 
 
+  (*Gestion de l'interface clients/processus*)
 
-
-  let transmit_client_comm client_id client_output =
-    match read_all client_output with
+  let transmit_proc_comm proc_id proc_output =
+    match read_all proc_output with
     |0 -> ()
-    |n -> send_bytes buffer n; (*Vérifier que write ne modifie pas le buffer 
-                                 ATTENTION PROBLEME D'ECRASEMENT SI PLUSIEURS PROCESSUS ECRIVENT
-                                 OU SI 1 ECRIT TROP VITE*)
+    |n -> send_bytes buffer n; (*Vérifier que write ne modifie pas le buffer*)
           let (d: 'a communication) = Marshal.from_bytes buffer 0 in
           match d with
           |DATA d -> ()
-          |DATA_REQUEST port -> Hashtbl.add pipe_process_corres client_id port
-          |CHANNEL_QUERY -> Queue.push client_id need_pipe
+          |RESULT d -> Hashtbl.remove proc_inputs proc_id;
+                       Hashtbl.remove proc_outputs proc_id 
+          |DATA_REQUEST port -> Hashtbl.add pipe_process_corres port proc_id
+          |CHANNEL_QUERY -> Queue.push proc_id need_pipe
           |DOCO l -> ()
           |_ -> failwith "a process cannot generate such communication"
+
+
+  (*Gestion de l'interface client/serveur*)
 
   let write_in_proc ofs size proc =
     try      
       let proc_fd = Hashtbl.find proc_inputs proc in
       let _ = Unix.write proc_fd buffer ofs size in
       ()
-    with Not_found -> failwith "Tentative de communication avec un client inexistant"
+    with Not_found -> failwith "Tentative de communication avec un processus inexistant"
 
   let apply_instruction ofs size comm = match comm with
     |CHANNEL n ->
@@ -196,7 +204,7 @@ module Th: S = struct
     |EXECUTE p ->
       let temp_input, proc_input = Unix.pipe () in
       let proc_output, temp_output = Unix.pipe () in
-      let proc_id = new_id () in
+      let proc_id = p.id in
       Hashtbl.add proc_outputs proc_id proc_output;
       Hashtbl.add proc_inputs proc_id proc_input;
       begin
@@ -204,9 +212,13 @@ module Th: S = struct
         |0 ->
           input := Some temp_input;
           output := Some temp_output;
-          let _ = p.proc () in exit 0 (*TODO : gérer la valeur finale -> pour le processus principal et pour terminer les DOCO*)
+          let v = p.proc () in
+          send_data (RESULT {target = p.id; data = v});
+          exit 0
         |_ -> ()
       end
+    |DOCO_CONFIRM proc ->
+      write_in_proc ofs size proc
     |_ -> failwith "Une instruction n'ayant aucun sens a été reçue du serveur"
 
   let transmit_server_comm () =
@@ -227,11 +239,14 @@ module Th: S = struct
               in aux 0
       end
 
+
+
+  (*Fonctions de connexion*)
+
   let rec routine socket =
-    Hashtbl.iter transmit_client_comm proc_outputs;
-    assert false
-
-
+    Hashtbl.iter transmit_proc_comm proc_outputs;
+    transmit_server_comm ();
+    routine socket
     
 
   let make_addr name port =
@@ -262,7 +277,7 @@ module Th: S = struct
 
   let put ?flags:(flags = []) x c =
     let p = fun () -> send_data (DATA { target = c; data = x })
-    in {proc = p; flags = flags}
+    in {proc = p; flags = flags; id = -1}
 
   let get ?flags:(flags = []) (c: 'a in_port) =
     let p =
@@ -274,25 +289,25 @@ module Th: S = struct
                   else
                     x.data
                 |_ -> failwith "Wrong communication input"
-    in {proc = p; flags = flags}
+    in {proc = p; flags = flags; id = -1}
 
 
   let return ?flags:(flags = []) x =
     let p= fun () -> x
-    in {proc = p; flags = flags}
+    in {proc = p; flags = flags; id = -1}
 
   let bind ?flags:(flags = []) p1 f =
     let p = fun () -> let v = p1.proc () in
                       let p2 = f v in
                       p2.proc ()
-    in {proc = p; flags = flags}
+    in {proc = p; flags = flags; id = p1.id}
 
   let distribute l =
     assert false (*TODO : envoyer au serveur la liste de processus à répartir*)
 
 
   let doco l =
-    {proc = (fun () -> distribute l); flags = []}
+    {proc = (fun () -> distribute l); flags = []; id = -1}
     
 
 
