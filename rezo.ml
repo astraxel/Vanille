@@ -101,14 +101,16 @@ module Th: S = struct
                                 
 
   (*VARIABLES GLOBALES*)
-                                
-  let input = ref None (*Some file_descr*)
-  let output = ref None (*Some file_descr*)
-
+                                  
   let max_comm_size = 1024*1024
   let buffer = Bytes.create max_comm_size
 
-  (*Note : les processus sont identifiés pour chaque machine par un id. Au plus max_int processus peuvent être exécutés sur une même connexion.
+  (*Processus*)
+  let input = ref None (*Some file_descr*)
+  let output = ref None (*Some file_descr*)
+
+  (*Client
+    Note : les processus sont identifiés pour chaque machine par un id. Au plus max_int processus peuvent être exécutés sur une même connexion.
     Les processus bindés ne comptent pas pour de nouveau processus *)
   let proc_inputs = Hashtbl.create 5 (*file_descr des inputs des process*)
   let proc_outputs = Hashtbl.create 5 (*file_descr des outputs des process*)
@@ -116,7 +118,16 @@ module Th: S = struct
   let need_pipe = Queue.create () (*Queue des processus en attente d'un nouvel id de channel*)
 
 
-  let new_id = let r=ref 0 in (fun () -> incr r; !r)
+
+  (*Serveur*)
+                
+  let new_channel = let r=ref 0 in (fun () -> incr r; !r)
+  let new_proc = let s=ref 0 in (fun () -> incr s; !s)
+                              
+  let client_inputs = Hashtbl.create 5
+  let client_outputs = Hashtbl.create 5
+  let client_charge = Hashtbl.create 5 (*Nb de processus en cours sur le client*)
+  let valid_clients = ref [] (*Liste des clients qui ne se sont pas déconnectés*)
              
 
 
@@ -140,19 +151,22 @@ module Th: S = struct
       ()
     |None -> failwith "No communications are enabled for this process"
 
-  let read_all fd =
-    let rec aux ofs =
-      if ofs <> max_comm_size then
-        let test = Unix.read fd buffer ofs 1 in
-        if test <> 0 then aux (ofs+1)
-        else ofs
-      else ofs
-    in aux 0
+  let read_comm fd =
+    let n = Unix.read fd buffer 0 Marshal.header_size in
+    if n=0 then
+      0
+    else
+      let size = Marshal.data_size buffer 0 in
+      let temp = Unix.read fd buffer Marshal.header_size size in
+      if temp <> size then
+        failwith "Erreur lors de la transmission de données : données incomplètes"
+      else
+        size + Marshal.header_size
 
   let get_data () =
     match (!input) with
     |Some chan ->
-      let rec loop () = match read_all chan with
+      let rec loop () = match read_comm chan with
         |0 -> loop ()
         |_ -> ()
       in loop ();
@@ -163,7 +177,7 @@ module Th: S = struct
   (*Gestion de l'interface clients/processus*)
 
   let transmit_proc_comm proc_id proc_output =
-    match read_all proc_output with
+    match read_comm proc_output with
     |0 -> ()
     |n -> send_bytes buffer n; (*Vérifier que write ne modifie pas le buffer*)
           let (d: 'a communication) = Marshal.from_bytes buffer 0 in
@@ -179,26 +193,26 @@ module Th: S = struct
 
   (*Gestion de l'interface client/serveur*)
 
-  let write_in_proc ofs size proc =
+  let write_in_proc size proc =
     try      
       let proc_fd = Hashtbl.find proc_inputs proc in
-      let _ = Unix.write proc_fd buffer ofs size in
+      let _ = Unix.write proc_fd buffer 0 size in
       ()
     with Not_found -> failwith "Tentative de communication avec un processus inexistant"
 
-  let apply_instruction ofs size comm = match comm with
+  let apply_instruction size comm = match comm with
     |CHANNEL n ->
       begin
         try
           let proc = Queue.take need_pipe in
-          write_in_proc ofs size proc
+          write_in_proc size proc
         with Queue.Empty -> failwith "Attribution d'un channel non demandé"
       end
     |DATA d ->
       begin
         try
           let proc = Hashtbl.find pipe_process_corres d.target in
-          write_in_proc ofs size proc
+          write_in_proc size proc
         with Not_found -> failwith "La cible de la communication n'est pas sur ce client"
       end
     |EXECUTE p ->
@@ -218,28 +232,21 @@ module Th: S = struct
         |_ -> ()
       end
     |DOCO_CONFIRM proc ->
-      write_in_proc ofs size proc
+      write_in_proc size proc
     |_ -> failwith "Une instruction n'ayant aucun sens a été reçue du serveur"
 
   let transmit_server_comm () =
     match (!input) with
     |None -> failwith "Connexion au serveur échouée, pas de socket paramétré"
     |Some chan ->
-      begin
-        match read_all chan with
+      let rec aux () =
+        match read_comm chan with
         |0 -> ()
-        |n -> let rec aux ofs =
-                try
-                  let (d: 'a communication) = Marshal.from_bytes buffer ofs in
-                  let size = Marshal.total_size buffer ofs in
-                  apply_instruction ofs size d;
-                  aux (ofs + size)
-                with End_of_file -> ()
-                   | _ -> failwith "Une erreur est survenue lors de la lecture des données envoyées par le serveur"
-              in aux 0
-      end
-
-
+        |n -> let (d: 'a communication) = Marshal.from_bytes buffer 0 in
+              apply_instruction n d;
+              aux ()
+      in aux ()
+      
 
   (*Fonctions de connexion*)
 
@@ -260,6 +267,16 @@ module Th: S = struct
 
   let init serv port =
     run_client routine (make_addr serv port)
+    
+
+
+
+  (* FONCTIONS SERVEUR *)
+
+  let rec accept_clients () =
+    assert false (*C'est le plus compliqué*)
+
+
 
     
 
