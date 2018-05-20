@@ -15,7 +15,17 @@ module type S = sig
 
   val run: 'a process -> 'a
 end
-              
+
+module type Lib  =
+  functor (K:S) ->
+  sig
+    val ( >>= ) : 'a K.process -> ('a -> 'b K.process) -> 'b K.process
+      
+    val delay : 'a -> ('a -> 'b) -> 'b K.process
+
+    val par_map : ('a -> 'b) -> 'a list -> 'b list
+  end
+  
 module Lib (K : S) = struct
 
   let ( >>= ) x f = K.bind x f
@@ -23,28 +33,27 @@ module Lib (K : S) = struct
   let delay f x =
     K.bind (K.return ()) (fun () -> K.return (f x))
 
-(*
+
   let par_map f l =
-    let rec build_workers l (ports, workers) =
-      match l with
-      | [] -> (ports, workers)
-      | x :: l ->
-          let qi, qo = K.new_channel () in
-          build_workers
-            l
-            (qi :: ports,
-             ((delay f x) >>= (fun v -> K.put v qo)) :: workers)
+    let rec build_channels l accin accout = match l with
+      |[] -> K.return (accin,accout)
+      |x::q -> K.bind (K.new_channel ()) (fun (qi,qo) -> build_channels q (qi::accin) (qo::accout))
     in
-    let ports, workers = build_workers l ([], []) in
-    let rec collect l acc qo =
-      match l with
-      | [] -> K.put acc qo
-      | qi :: l -> (K.get qi) >>= (fun v -> collect l (v :: acc) qo)
+    let rec build_workers l accout = match l with
+      |[] -> []
+      |x::q -> let qo::r=accout in
+               ((delay f x) >>= (fun v -> K.put v qo))::(build_workers q r)
     in
-    let qi, qo = K.new_channel () in
+    let rec collect accin = match accin with
+      |[] -> K.return []
+      |qi::r -> collect r >>= (fun l -> ((K.get qi) >>= (fun v -> K.return (v::l))))
+    in
+    let first_part l qo =
+      build_channels l [] [] >>= (fun (accin,accout) -> K.doco ((K.put (collect accin) qo)::(build_workers l accout)))
+    in
     K.run
-      ((K.doco ((collect ports [] qo) :: workers)) >>= (fun _ -> K.get qi))
- *)
+      (K.new_channel () >>= (fun (qi,qo) -> (first_part l qo) >>= (fun _ -> K.get qi)))
+ 
 
 end
               
@@ -157,32 +166,33 @@ module Th: S = struct
   let client_outputs = Hashtbl.create 5
   let clients = Hashtbl.create 5 (*Ensemble des clients de type client_state*)
   let doco_counts = Hashtbl.create 5 (*contient des doco_count pour chaque process de type doco*)
+  let parents = Hashtbl.create 5 (*contient les parents des processus distribués par doco*)
   let pipes = Hashtbl.create 5 (*contient les pipes entre processus, hébergées sur serveur*)
   let waiting_for_data = ref [] (*Liste des channels en attente de données.
                                   On pourrait faire un fork et un read bloquant, mais après
                                   il y aurai peut-être des choses bizarres lors du write dans le
                                   socket pour l'envoi*)
-  let global_result = ref None (*résultat final de l'exécution
-                                 C'est le résultat du processus d'id 0
-                                 Si cette variable ne contient pas None, la routine serveur
-                                 termine.*)
+  let port = ref 1042 (*Port de connection du serveur*)
 
   (* FONCTIONS DE LECTURE ET D'ECRITURE *)
                   
   let read_comm fd =
-    let n = Unix.read fd buffer 0 Marshal.header_size in
-    if n=0 then
-      0
-    else
-      let size = Marshal.data_size buffer 0 in
-      let temp = Unix.read fd buffer Marshal.header_size size in
-      if temp <> size then
-        failwith "Erreur lors de la transmission de données : données incomplètes"
+    try
+      let n = Unix.read fd buffer 0 Marshal.header_size in
+      if n=0 then
+        0
       else
-        size + Marshal.header_size
+        let size = Marshal.data_size buffer 0 in
+        let temp = Unix.read fd buffer Marshal.header_size size in
+        if temp <> size then
+          failwith "Erreur lors de la transmission de données : données incomplètes"
+        else
+          size + Marshal.header_size
+    with
+      Unix.Unix_error (Unix.EAGAIN,_,_) | Unix.Unix_error (Unix.EWOULDBLOCK,_,_) -> 0
 
   let write_comm comm fd =
-    let b = Marshal.to_bytes comm [Closures] in
+    let b = Marshal.to_bytes comm [Marshal.Closures] in
     if Bytes.length b > max_comm_size then failwith "trying to send data too big";    
     let _ = Unix.write fd b 0 (Bytes.length b) in
     ()
@@ -205,7 +215,7 @@ module Th: S = struct
     |None -> failwith "No communications are enabled for this process"
 
 
-  let get_data ?i:(i= !input) () =
+  let get_data ?i:(i= !input) () = (*En théorie, les pipes concernées sont blocantes, donc inutile*)
     match i with
     |Some chan ->
       let rec loop () = match read_comm chan with
@@ -268,6 +278,7 @@ module Th: S = struct
     |EXECUTE p ->
       let temp_input, proc_input = Unix.pipe () in
       let proc_output, temp_output = Unix.pipe () in
+      Unix.set_nonblock proc_output;
       let proc_id = p.id in
       Hashtbl.add proc_outputs proc_id proc_output;
       Hashtbl.add proc_inputs proc_id proc_input;
@@ -301,23 +312,43 @@ module Th: S = struct
 
   (*Fonctions de connexion*)
 
-  let rec client_routine socket =
+  let transmit_IO_comm pipout =
+    try
+      match (Unix.read pipout buffer 0 1) with
+      |0 -> ()
+      |_ -> send_data DC_QUERY
+    with
+    |Unix.Unix_error (Unix.EAGAIN,_,_) | Unix.Unix_error (Unix.EWOULDBLOCK,_,_) -> ()
+
+  let rec client_routine pipout socket =
     Hashtbl.iter transmit_proc_comm proc_outputs;
     transmit_server_comm ();
-    client_routine socket
+    transmit_IO_comm pipout;
+    client_routine pipout socket
     
 
   let make_addr name port =
     let entry = Unix.gethostbyname name in
     Unix.ADDR_INET (entry.h_addr_list.(0),port)
 
-  let run_client f addr =
+  let run_client  f addr =
     let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
     Unix.connect socket addr;
     f socket
 
+  let rec run_IO pipin =
+    print_string "Tapez \q pour initier la déconnexion du client";
+    if (read_line ()) = "\q" then
+      let _ = Unix.write_substring pipin "OK" 0 2 in ();
+    else
+      run_IO pipin
+
   let init serv port =
-    run_client client_routine (make_addr serv port)
+    let pipout,pipin = Unix.pipe () in
+    Unix.set_nonblock pipout;
+    match Unix.fork () with
+    |0 -> run_client (client_routine pipout) (make_addr serv port)
+    |n -> run_IO pipin
 
 
   (*FONCTIONS D'ÉCRITURE DE PROGRAMMES*)
@@ -327,7 +358,7 @@ module Th: S = struct
     let d = get_data ~i:i () in
     match d with
     |CHANNEL c -> c,c
-    |_ -> failwith "Wrong communication input, expected a channel"      
+    |_ -> failwith "Erreur lors de la création d'un nouveau channel"      
     
 
   let new_channel () =
@@ -353,10 +384,10 @@ module Th: S = struct
     match d with
     |DATA x ->
       if x.target <> c then
-        failwith "Wrong target for communication"
+        failwith "La cible de la communication est incorrecte"
       else
         x.data
-    |_ -> failwith "Wrong communication input, expected some data"
+    |_ -> failwith "Erreur de format : des données étaient attendues"
 
   let get ?flags:(flags = []) (c: 'a in_port) =
     {proc = get_process c; flags = flags; id = -1}
@@ -388,9 +419,6 @@ module Th: S = struct
 
   (* FONCTIONS SERVEUR *)
 
-  let rec accept_clients () =
-    assert false (*C'est le plus compliqué*)
-
   let send_message client_id comm =
     match Hashtbl.find_opt client_inputs client_id with
     |None -> failwith "Envoi d'une donnée à un client inexistant"
@@ -418,20 +446,19 @@ module Th: S = struct
     |[] -> ()
     |p::q -> let id = new_proc () in
              p.id <- id;
-             let final_process = bind p (fun () -> return target) in
+             Hashtbl.add parents id target;
              let c = find_minimal_client () in
              if c= -1 then failwith "No client available for this process";
              incr_load c;
-             send_message c (EXECUTE final_process)
+             send_message c (EXECUTE p)
              
-             
-
 
   let handle_communication client_id size d = match d with
-    |DC_QUERY -> init_disconnection client_id
+    |DC_QUERY -> init_disconnection client_id; None
     |CHANNEL_QUERY ->
       let c = new_chan () in
-      send_message client_id (CHANNEL c)
+      send_message client_id (CHANNEL c);
+      None
     |DATA d ->
       begin
         match (Hashtbl.find_opt pipes d.target) with
@@ -440,12 +467,15 @@ module Th: S = struct
           let q = Queue.create () in
           Queue.add (Bytes.sub buffer 0 size) q;
           Hashtbl.add pipes d.target q
-      end
+      end;
+      None
     |DATA_REQUEST channel ->
-      waiting_for_data := {pipe_id = channel; client_id = client_id}::(!waiting_for_data)
+      waiting_for_data := {pipe_id = channel; client_id = client_id}::(!waiting_for_data);
+      None
     |DOCO x -> let length = List.length x.content in
-               Hashtbl.add doco_counts x.target {current = 0; total = length; client = client_id};
-               distribute x.content x.target
+               Hashtbl.add doco_counts x.target {current = 0; total = length;  client = client_id};
+               distribute x.content x.target;
+               None
     |RESULT x ->
       begin
         try
@@ -454,9 +484,10 @@ module Th: S = struct
         with Not_found -> failwith "Retour d'un client inexistant"
       end;
       if x.target = 0 then
-        global_result := Some x.data
+        Some x.data
       else
-        let parent = x.data in
+        let parent = Hashtbl.find parents x.target in
+        Hashtbl.remove parents x.target;
         begin
           try
             let count = Hashtbl.find doco_counts parent in
@@ -467,16 +498,19 @@ module Th: S = struct
                 Hashtbl.remove doco_counts parent
               end
           with Not_found -> failwith "Présence d'un processus orphelin"
-        end
+        end;
+        None
     |_ -> failwith "Communication impossible vers le serveur reçue"
     
 
   let rec handle_client client_id client_output =
     match read_comm client_output with
-    |0 -> ()
+    |0 -> None
     |n -> let (d: 'a communication) = Marshal.from_bytes buffer 0 in
-          handle_communication client_id n d;
-          handle_client client_id client_output
+          let res = handle_communication client_id n d in
+          match handle_client client_id client_output with
+          |None -> res
+          |x -> x
 
   let handle_data_requests () =
     let rec aux l = match l with
@@ -512,23 +546,58 @@ module Th: S = struct
                        Hashtbl.remove clients client_id
     in
     List.iter g l_dc  
-          
 
-  let rec server_routine () =
+
+  let rec accept_clients socket () =
+    try      
+      let fd,_ = Unix.accept socket in
+      let client_id = new_client () in
+      Hashtbl.add client_inputs client_id fd;
+      Hashtbl.add client_outputs client_id fd;
+      Hashtbl.add clients client_id {load=0; connected=true};
+      accept_clients socket ()
+    with
+    |Unix.Unix_error (Unix.EAGAIN,_,_) |Unix.Unix_error (Unix.EWOULDBLOCK,_,_) -> ()
+    |_ -> failwith "Erreur lors de la connexion d'un client"
+
+  let rec start first_process = match first_process with
+    |None -> None
+    |Some p  -> let c = find_minimal_client () in
+                if c= -1 then Some p
+                else
+                  begin
+                    incr_load c;
+                    send_message c (EXECUTE p);
+                    None
+                  end
+
+
+        
+
+  let rec server_routine socket first_process () =  
     disconnect_clients ();
-    accept_clients ();
-    Hashtbl.iter handle_client client_outputs;
+    accept_clients socket ();
+    let fp = start first_process in
+    let f  k fd res = match handle_client k fd with
+      |None -> res
+      |x -> x
+    in
+    let result = Hashtbl.fold f client_outputs None in
     handle_data_requests ();
-    match (!global_result) with
-    |None -> server_routine ()
+    match result with
+    |None -> server_routine socket fp ()
     |Some x -> x
     
 
 
-  let run p = assert false (* TODO : init le serveur, les relations avec les clients, 
-                              et lancer le process*)   
-
-
+  let run p =
+    let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM (!port) in
+    Unix.set_nonblock socket;
+    Unix.bind socket (Unix.ADDR_INET (Unix.inet_addr_any,!port));
+    Unix.listen socket 10;
+    p.id <- 0;
+    server_routine socket (Some p) ()
+    
     
     
 
