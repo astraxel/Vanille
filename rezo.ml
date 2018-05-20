@@ -4,7 +4,7 @@ module type S = sig
   type 'a in_port
   type 'a out_port
 
-  val new_channel: unit -> 'a in_port * 'a out_port
+  val new_channel: unit -> ('a in_port * 'a out_port) process
   val put: ?flags: flag list -> 'a -> 'a out_port -> unit process
   val get: ?flags: flag list -> 'a in_port -> 'a process
 
@@ -23,6 +23,7 @@ module Lib (K : S) = struct
   let delay f x =
     K.bind (K.return ()) (fun () -> K.return (f x))
 
+(*
   let par_map f l =
     let rec build_workers l (ports, workers) =
       match l with
@@ -43,6 +44,7 @@ module Lib (K : S) = struct
     let qi, qo = K.new_channel () in
     K.run
       ((K.doco ((collect ports [] qo) :: workers)) >>= (fun _ -> K.get qi))
+ *)
 
 end
               
@@ -52,10 +54,10 @@ module Th: S = struct
             (* Les processus avec le flag MACHINE x identiques seront exécutés sur la même machine.
                Note : Dans le cas d'un bind, le flag doit être précisé sur le premier processus.
                Cela permet de maintenir des processus communiquant entre eux sur la même machine,
-               et donc de réduire les communications réseau.
+               et donc de réduire les communications réseau. -> non implémenté
              *)
             
-  type 'a process = { proc : (unit -> 'a);
+  type 'a process = { proc : (Unix.file_descr option -> Unix.file_descr option -> unit -> 'a);
                       flags : flag list;
                       mutable id : int;
                     }
@@ -67,6 +69,8 @@ module Th: S = struct
 
                        Pour gérer les questions de doco, chaque processus aura un id. 
                        Il est à -1 initialement, et est modifié par le serveur
+
+                       On doit passer les input/output en argument sinon Marshall fait de la merde
                      *)
 
 
@@ -116,9 +120,6 @@ module Th: S = struct
                                                     la procédure de déconnexion*)
                       }
 
-  type pipe = { input : Unix.file_descr;
-                output : Unix.file_descr
-              }
 
   type pipe_request = { pipe_id : int;
                         client_id : int
@@ -156,7 +157,7 @@ module Th: S = struct
   let client_outputs = Hashtbl.create 5
   let clients = Hashtbl.create 5 (*Ensemble des clients de type client_state*)
   let doco_counts = Hashtbl.create 5 (*contient des doco_count pour chaque process de type doco*)
-  let pipes = Hashtbl.create 5 (*contient les file_descr des pipes*)
+  let pipes = Hashtbl.create 5 (*contient les pipes entre processus, hébergées sur serveur*)
   let waiting_for_data = ref [] (*Liste des channels en attente de données.
                                   On pourrait faire un fork et un read bloquant, mais après
                                   il y aurai peut-être des choses bizarres lors du write dans le
@@ -182,7 +183,7 @@ module Th: S = struct
 
   let write_comm comm fd =
     let b = Marshal.to_bytes comm [Closures] in
-    if Bytes.length b > max_comm_size then failwith "trying to send data too big";
+    if Bytes.length b > max_comm_size then failwith "trying to send data too big";    
     let _ = Unix.write fd b 0 (Bytes.length b) in
     ()
 
@@ -191,21 +192,21 @@ module Th: S = struct
              
   (*Fonctions de lecture et d'écriture*)
                  
-  let send_data comm =
-    match (!output) with
+  let send_data ?o:(o= !output) comm =
+    match o with
     |Some chan -> write_comm comm chan
     |None -> failwith "No communications are enabled for this process"
 
-  let send_bytes b length=
-    match (!output) with
+  let send_bytes ?o:(o= !output) b length=
+    match o with
     |Some chan ->
       let _ = Unix.write chan b 0 length in
       ()
     |None -> failwith "No communications are enabled for this process"
 
 
-  let get_data () =
-    match (!input) with
+  let get_data ?i:(i= !input) () =
+    match i with
     |Some chan ->
       let rec loop () = match read_comm chan with
         |0 -> loop ()
@@ -223,15 +224,21 @@ module Th: S = struct
     |n -> let (d: 'a communication) = Marshal.from_bytes buffer 0 in
           begin
             match d with
-            |DATA d -> ()
+            |DATA d -> send_bytes buffer n
             |RESULT _ -> Hashtbl.remove proc_inputs proc_id;
-                         Hashtbl.remove proc_outputs proc_id 
-            |DATA_REQUEST port -> Hashtbl.add pipe_process_corres port proc_id
-            |CHANNEL_QUERY -> Queue.push proc_id need_pipe
-            |DOCO _ -> ()
+                         Hashtbl.remove proc_outputs proc_id;
+                         send_bytes buffer n
+            |DATA_REQUEST port -> Hashtbl.add pipe_process_corres port proc_id;
+                                  send_bytes buffer n
+            |CHANNEL_QUERY -> Queue.push proc_id need_pipe;
+                              send_bytes buffer n
+            |DOCO d ->
+              let l = d.content in
+              let real_d = {content = l; target = proc_id} in
+              send_data real_d
             |_ -> failwith "a process cannot generate such communication"
-          end;
-          send_bytes buffer n (*Vérifier que write ne modifie pas le buffer*)
+          end
+          
 
 
   (*Gestion de l'interface client/serveur*)
@@ -269,7 +276,7 @@ module Th: S = struct
         |0 ->
           input := Some temp_input;
           output := Some temp_output;
-          let v = p.proc () in
+          let v = p.proc (Some temp_input) (Some temp_output) () in
           send_data (RESULT {target = p.id; data = v});
           exit 0
         |_ -> ()
@@ -314,52 +321,67 @@ module Th: S = struct
 
 
   (*FONCTIONS D'ÉCRITURE DE PROGRAMMES*)
+
+  let new_channel_process i o () =
+    send_data ~o:o (CHANNEL_QUERY);
+    let d = get_data ~i:i () in
+    match d with
+    |CHANNEL c -> c,c
+    |_ -> failwith "Wrong communication input, expected a channel"      
     
 
   let new_channel () =
-    send_data (CHANNEL_QUERY);
-    let d = get_data () in
-    match d with
-    |CHANNEL c -> c,c
-    |_ -> failwith "Wrong communication input, expected a channel"
+    {proc = new_channel_process;
+     flags = [];
+     id = -1
+    }
+  (*On a changé la signature de new_channel à cause du problème de Closures sur Marshall*)
+    
 
     
   (* Attention : buffer des pipes de 65536 octets, il faut donc fork avant d'écrire 
      -> non, tout sera stocké sur le serveur *)
 
+  let put_process x c i o () =
+    send_data ~o:o (DATA { target = c; data = x })
+    
   let put ?flags:(flags = []) x c =
-    let p = fun () -> send_data (DATA { target = c; data = x })
-    in {proc = p; flags = flags; id = -1}
+    {proc = put_process x c; flags = flags; id = -1}
+
+  let get_process c i o () =
+    let d = get_data ~i:i () in
+    match d with
+    |DATA x ->
+      if x.target <> c then
+        failwith "Wrong target for communication"
+      else
+        x.data
+    |_ -> failwith "Wrong communication input, expected some data"
 
   let get ?flags:(flags = []) (c: 'a in_port) =
-    let p =
-      fun () -> let d = get_data () in
-                match d with
-                |DATA x ->
-                  if x.target <> c then
-                    failwith "Wrong target for communication"
-                  else
-                    x.data
-                |_ -> failwith "Wrong communication input, expected some data"
-    in {proc = p; flags = flags; id = -1}
+    {proc = get_process c; flags = flags; id = -1}
 
+
+  let return_process x i o () =
+    x
 
   let return ?flags:(flags = []) x =
-    let p= fun () -> x
-    in {proc = p; flags = flags; id = -1}
+    {proc = return_process x; flags = flags; id = -1}
+
+  let bind_process p1 f i o () =
+    let v = p1.proc i o () in
+    let p2 = f v in
+    p2.proc i o ()
 
   let bind p1 f =
-    let p = fun () -> let v = p1.proc () in
-                      let p2 = f v in
-                      p2.proc ()
-    in {proc = p; flags = p1.flags; id = p1.id}
+    {proc = bind_process p1 f; flags = p1.flags; id = p1.id}
 
-  let send_doco l =
-    assert false (*TODO : envoyer au serveur la liste de processus à répartir*)
+  let send_doco l i o ()=
+    send_data ~o:o (DOCO {content = l; target = -1})
 
 
   let doco l =
-    {proc = (fun () -> send_doco l); flags = []; id = -1}
+    {proc = send_doco l; flags = []; id = -1}
     
 
 
@@ -413,10 +435,11 @@ module Th: S = struct
     |DATA d ->
       begin
         match (Hashtbl.find_opt pipes d.target) with
-        |Some p -> let _ = Unix.write p.input buffer 0 size in ()
-        |None -> let temp_output, temp_input = Unix.pipe () in
-                 Hashtbl.add pipes d.target { input = temp_input ; output = temp_output};
-                 let _ = Unix.write temp_input buffer 0 size in ()
+        |Some q -> Queue.add (Bytes.sub buffer 0 size) q
+        |None ->
+          let q = Queue.create () in
+          Queue.add (Bytes.sub buffer 0 size) q;
+          Hashtbl.add pipes d.target q
       end
     |DATA_REQUEST channel ->
       waiting_for_data := {pipe_id = channel; client_id = client_id}::(!waiting_for_data)
@@ -461,16 +484,14 @@ module Th: S = struct
       |x::q ->
         match (Hashtbl.find_opt pipes x.pipe_id) with
         |None -> x::(aux q)
-        |Some p ->
-          let n = Unix.read p.output buffer 0 Marshal.header_size in
-          if n = 0 then
+        |Some c ->
+          if Queue.is_empty c then
             x::(aux q)
           else
-            let size = Marshal.data_size buffer 0 in
-            let _ = Unix.read p.output buffer Marshal.header_size size in
             try
+              let message = Queue.take c in
               let fd = Hashtbl.find client_inputs x.client_id in
-              let _ = Unix.write fd buffer 0 (size + Marshal.header_size) in
+              let _ = Unix.write fd message 0 (Bytes.length message) in
               aux q
             with
               Not_found -> failwith "Tentative de communication avec un client inexistant"
