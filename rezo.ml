@@ -4,7 +4,7 @@ module type S = sig
   type 'a in_port
   type 'a out_port
 
-  val new_channel: unit -> ('a in_port * 'a out_port) process
+  val new_channel: ?flags: flag list -> unit -> ('a in_port * 'a out_port) process
   val put: ?flags: flag list -> 'a -> 'a out_port -> unit process
   val get: ?flags: flag list -> 'a in_port -> 'a process
 
@@ -374,9 +374,9 @@ module Th: S = struct
     |_ -> failwith "Erreur lors de la creation d'un nouveau channel"      
     
 
-  let new_channel () =
+  let new_channel ?flags:(flags=[]) () =
     {proc = new_channel_process;
-     flags = [];
+     flags = flags;
      id = -1
     }
   (*On a changé la signature de new_channel à cause du problème de Closures sur Marshall*)
