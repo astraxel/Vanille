@@ -23,7 +23,7 @@ module type Lib  =
   sig
     val ( >>= ) : 'a K.process -> ('a -> 'b K.process) -> 'b K.process
       
-    val delay : 'a -> ('a -> 'b) -> 'b K.process
+    val delay : ('a -> 'b) -> 'a -> 'b K.process
 
     val par_map : ('a -> 'b) -> 'a list -> 'b list
   end
@@ -238,14 +238,15 @@ module Th: S = struct
             |RESULT _ -> Hashtbl.remove proc_inputs proc_id;
                          Hashtbl.remove proc_outputs proc_id;
                          send_bytes buffer n
-            |DATA_REQUEST port -> Hashtbl.add pipe_process_corres port proc_id;
-                                  send_bytes buffer n
+            |DATA_REQUEST port ->
+              Hashtbl.add pipe_process_corres port proc_id;
+              send_bytes buffer n
             |CHANNEL_QUERY -> Queue.push proc_id need_pipe;
                               send_bytes buffer n
             |DOCO d ->
               let l = d.content in
               let real_d = {content = l; target = proc_id} in
-              send_data real_d
+              send_data (DOCO real_d)
             |_ -> failwith "a process cannot generate such communication"
           end
           
@@ -337,7 +338,8 @@ module Th: S = struct
     print_string "Initialisation de la connexion\n";
     let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
     Unix.connect socket addr;
-    print_string "Connexion etablie\n";
+    Unix.set_nonblock socket;
+    print_endline "Connexion etablie\n\n";
     input := Some socket;
     output := Some socket;
     f socket
@@ -347,7 +349,7 @@ module Th: S = struct
     if (read_line ()) = "\q" then
       begin
         print_string "Initialisation de la deconnexion. Les affichages des processus continueront a apparaitre dans cette fenetre.\n";
-        let _ = Unix.write_substring pipin "OK" 0 2 in ()
+        let _ = Unix.write_substring pipin "OK" 0 2 in exit 0;
       end
     else
       run_IO pipin
@@ -355,12 +357,11 @@ module Th: S = struct
   let init_client ?port:(port=1042) serv=
     let pipout,pipin = Unix.pipe () in
     Unix.set_nonblock pipout;
-    run_client (client_routine pipout) (make_addr serv port)
-    (*
+    (*run_client (client_routine pipout) (make_addr serv port)*)    
     match Unix.fork () with
     |0 -> run_client (client_routine pipout) (make_addr serv port)
     |n -> run_IO pipin
-     *)
+    
 
 
   (*FONCTIONS D'ÉCRITURE DE PROGRAMMES*)
@@ -392,6 +393,7 @@ module Th: S = struct
     {proc = put_process x c; flags = flags; id = -1}
 
   let get_process c i o () =
+    send_data ~o:o (DATA_REQUEST c);
     let d = get_data ~i:i () in
     match d with
     |DATA x ->
@@ -420,7 +422,8 @@ module Th: S = struct
     {proc = bind_process p1 f; flags = p1.flags; id = p1.id}
 
   let send_doco l i o ()=
-    send_data ~o:o (DOCO {content = l; target = -1})
+    send_data ~o:o (DOCO {content = l; target = -1});
+    let _ = get_data ~i:i () in ()
 
 
   let doco l =
@@ -454,7 +457,8 @@ module Th: S = struct
     |None -> failwith "Tentative d'attribution de processus a un client inexistant"
     |Some state -> state.load <- state.load + 1
 
-  let rec distribute (l: unit process list) target = match l with
+  let rec distribute (l: unit process list) target =
+    match l with
     |[] -> ()
     |p::q -> let id = new_proc () in
              p.id <- id;
@@ -462,7 +466,8 @@ module Th: S = struct
              let c = find_minimal_client () in
              if c= -1 then failwith "No client available for this process";
              incr_load c;
-             send_message c (EXECUTE p)
+             send_message c (EXECUTE p);
+             distribute q target
              
 
   let handle_communication client_id size d = match d with
@@ -516,13 +521,17 @@ module Th: S = struct
     
 
   let rec handle_client client_id client_output =
-    match read_comm client_output with
-    |0 -> None
-    |n -> let (d: 'a communication) = Marshal.from_bytes buffer 0 in
-          let res = handle_communication client_id n d in
-          match handle_client client_id client_output with
-          |None -> res
-          |x -> x
+    try
+      match read_comm client_output with
+      |0 -> None
+      |n -> let (d: 'a communication) = Marshal.from_bytes buffer 0 in
+            let res = handle_communication client_id n d in
+            match handle_client client_id client_output with
+            |None -> res
+            |x -> x
+    with
+       |Unix.Unix_error (Unix.EAGAIN,_,_) |Unix.Unix_error (Unix.EWOULDBLOCK,_,_) -> None
+       |_ -> failwith "Erreur lors de la reception de données d'un client"
 
   let handle_data_requests () =
     let rec aux l = match l with
@@ -545,17 +554,26 @@ module Th: S = struct
     in      
     waiting_for_data := aux (!waiting_for_data)
 
-  let disconnect_clients () =
+  let disconnect_clients ?all:(all=false) () =
     let f client_id state l=
-      if (not state.connected) && (state.load = 0) then
+      if all || ((not state.connected) && (state.load = 0)) then
         client_id::l
       else
         l
     in
-    let l_dc = Hashtbl.fold f clients [] in
-    let g client_id =  Hashtbl.remove client_inputs client_id;
-                       Hashtbl.remove client_outputs client_id;
-                       Hashtbl.remove clients client_id
+    let l_dc = Hashtbl.fold f clients []
+    in
+    let g client_id =
+      begin
+        try
+          let fd = Hashtbl.find client_outputs client_id in
+          write_comm DC_CONFIRM fd
+        with Not_found -> ()
+      end;
+      Hashtbl.remove client_inputs client_id;
+      Hashtbl.remove client_outputs client_id;
+      Hashtbl.remove clients client_id;
+
     in
     List.iter g l_dc  
 
@@ -563,6 +581,7 @@ module Th: S = struct
   let rec accept_clients socket () =
     try      
       let fd,_ = Unix.accept socket in
+      Unix.set_nonblock fd;
       let client_id = new_client () in
       Hashtbl.add client_inputs client_id fd;
       Hashtbl.add client_outputs client_id fd;
@@ -586,7 +605,7 @@ module Th: S = struct
 
         
 
-  let rec server_routine socket first_process () =  
+  let rec server_routine socket first_process () =
     disconnect_clients ();
     accept_clients socket ();
     let fp = start first_process in
@@ -598,7 +617,7 @@ module Th: S = struct
     handle_data_requests ();
     match result with
     |None -> server_routine socket fp ()
-    |Some x -> x
+    |Some x -> disconnect_clients ~all:true (); x
     
 
 
