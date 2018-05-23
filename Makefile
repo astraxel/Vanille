@@ -7,6 +7,7 @@ example:
 	$(OCAMLBUILD) example.$(TARGET)
 	$(OCAMLBUILD) exampleUnix.$(TARGET)
 	$(OCAMLBUILD) exampleSeq.$(TARGET)
+	$(OCAMLBUILD) exampleRezo.$(TARGET)
 
 
 clean:

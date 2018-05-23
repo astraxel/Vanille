@@ -13,7 +13,9 @@ module type S = sig
   val return: ?flags: flag list -> 'a -> 'a process
   val bind: 'a process -> ('a -> 'b process) -> 'b process
 
-  val run: 'a process -> 'a
+  val run: ?port: int -> 'a process -> 'a
+
+  val init_client: ?port:int -> string -> unit
 end
 
 module type Lib  =
@@ -39,22 +41,18 @@ module Lib (K : S) = struct
       |[] -> K.return (accin,accout)
       |x::q -> K.bind (K.new_channel ()) (fun (qi,qo) -> build_channels q (qi::accin) (qo::accout))
     in
-    let rec build_workers l accout = match l with
+    let rec build_workers f l accout = match l with
       |[] -> []
       |x::q -> let qo::r=accout in
-               ((delay f x) >>= (fun v -> K.put v qo))::(build_workers q r)
+               ((delay f x) >>= (fun v -> K.put v qo))::(build_workers f q r)
     in
     let rec collect accin = match accin with
       |[] -> K.return []
       |qi::r -> collect r >>= (fun l -> ((K.get qi) >>= (fun v -> K.return (v::l))))
     in
-    let first_part l qo =
-      build_channels l [] [] >>= (fun (accin,accout) -> K.doco ((K.put (collect accin) qo)::(build_workers l accout)))
-    in
-    K.run
-      (K.new_channel () >>= (fun (qi,qo) -> (first_part l qo) >>= (fun _ -> K.get qi)))
- 
-
+    let first_part f l qo =
+      build_channels l [] [] >>= (fun (accin,accout) -> K.doco ((K.put (collect accin) qo)::(build_workers f l accout)))
+    in K.run (K.new_channel () >>= fun (qi,qo) -> (first_part f l qo >>= (fun () ->  K.get qi)))
 end
               
 module Th: S = struct
@@ -172,7 +170,9 @@ module Th: S = struct
                                   On pourrait faire un fork et un read bloquant, mais après
                                   il y aurai peut-être des choses bizarres lors du write dans le
                                   socket pour l'envoi*)
-  let port = ref 1042 (*Port de connection du serveur*)
+  let pending_process = ref [] (*Liste des processus en attente d'être distribués
+                                Cette liste sera toujours vide sauf si tous les clients ont demand 
+                                une déconection et qu'il faut répartir des *)
 
   (* FONCTIONS DE LECTURE ET D'ECRITURE *)
                   
@@ -185,7 +185,7 @@ module Th: S = struct
         let size = Marshal.data_size buffer 0 in
         let temp = Unix.read fd buffer Marshal.header_size size in
         if temp <> size then
-          failwith "Erreur lors de la transmission de données : données incomplètes"
+          failwith "Erreur lors de la transmission de donnees : données incompletes"
         else
           size + Marshal.header_size
     with
@@ -193,7 +193,7 @@ module Th: S = struct
 
   let write_comm comm fd =
     let b = Marshal.to_bytes comm [Marshal.Closures] in
-    if Bytes.length b > max_comm_size then failwith "trying to send data too big";    
+    if Bytes.length b > max_comm_size then failwith "Les donnees a transferer sont trop grosses";  
     let _ = Unix.write fd b 0 (Bytes.length b) in
     ()
 
@@ -294,12 +294,12 @@ module Th: S = struct
       end
     |DOCO_CONFIRM proc ->
       write_in_proc size proc
-    |DC_CONFIRM -> exit 0
+    |DC_CONFIRM -> print_string "\nFin de l'exécution du client\n"; exit 0
     |_ -> failwith "Une instruction n'ayant aucun sens a été reçue du serveur"
 
   let transmit_server_comm () =
     match (!input) with
-    |None -> failwith "Connexion au serveur échouée, pas de socket paramétré"
+    |None -> failwith "Connexion au serveur echouee, pas de socket parametre"
     |Some chan ->
       let rec aux () =
         match read_comm chan with
@@ -328,27 +328,39 @@ module Th: S = struct
     
 
   let make_addr name port =
-    let entry = Unix.gethostbyname name in
-    Unix.ADDR_INET (entry.h_addr_list.(0),port)
+    try
+      let entry = Unix.gethostbyname name in
+      Unix.ADDR_INET (entry.Unix.h_addr_list.(0),port)
+    with Not_found -> failwith "Serveur non trouve"
 
-  let run_client  f addr =
+  let run_client f addr =
+    print_string "Initialisation de la connexion\n";
     let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
     Unix.connect socket addr;
+    print_string "Connexion etablie\n";
+    input := Some socket;
+    output := Some socket;
     f socket
 
   let rec run_IO pipin =
-    print_string "Tapez \q pour initier la déconnexion du client";
+    print_string "Tapez \q pour initier la deconnexion du client\n";
     if (read_line ()) = "\q" then
-      let _ = Unix.write_substring pipin "OK" 0 2 in ();
+      begin
+        print_string "Initialisation de la deconnexion. Les affichages des processus continueront a apparaitre dans cette fenetre.\n";
+        let _ = Unix.write_substring pipin "OK" 0 2 in ()
+      end
     else
       run_IO pipin
 
-  let init serv port =
+  let init_client ?port:(port=1042) serv=
     let pipout,pipin = Unix.pipe () in
     Unix.set_nonblock pipout;
+    run_client (client_routine pipout) (make_addr serv port)
+    (*
     match Unix.fork () with
     |0 -> run_client (client_routine pipout) (make_addr serv port)
     |n -> run_IO pipin
+     *)
 
 
   (*FONCTIONS D'ÉCRITURE DE PROGRAMMES*)
@@ -358,7 +370,7 @@ module Th: S = struct
     let d = get_data ~i:i () in
     match d with
     |CHANNEL c -> c,c
-    |_ -> failwith "Erreur lors de la création d'un nouveau channel"      
+    |_ -> failwith "Erreur lors de la creation d'un nouveau channel"      
     
 
   let new_channel () =
@@ -387,7 +399,7 @@ module Th: S = struct
         failwith "La cible de la communication est incorrecte"
       else
         x.data
-    |_ -> failwith "Erreur de format : des données étaient attendues"
+    |_ -> failwith "Erreur de format : des donnees etaient attendues"
 
   let get ?flags:(flags = []) (c: 'a in_port) =
     {proc = get_process c; flags = flags; id = -1}
@@ -421,7 +433,7 @@ module Th: S = struct
 
   let send_message client_id comm =
     match Hashtbl.find_opt client_inputs client_id with
-    |None -> failwith "Envoi d'une donnée à un client inexistant"
+    |None -> failwith "Envoi d'une donnee a un client inexistant"
     |Some fd -> write_comm comm fd
 
   let init_disconnection client_id =
@@ -439,7 +451,7 @@ module Th: S = struct
     in snd (Hashtbl.fold f clients (-1,-1))
 
   let incr_load client_id = match Hashtbl.find_opt clients client_id with
-    |None -> failwith "Tentative d'attribution de processus à un client inexistant"
+    |None -> failwith "Tentative d'attribution de processus a un client inexistant"
     |Some state -> state.load <- state.load + 1
 
   let rec distribute (l: unit process list) target = match l with
@@ -497,7 +509,7 @@ module Th: S = struct
                 send_message count.client (DOCO_CONFIRM parent);
                 Hashtbl.remove doco_counts parent
               end
-          with Not_found -> failwith "Présence d'un processus orphelin"
+          with Not_found -> failwith "Presence d'un processus orphelin"
         end;
         None
     |_ -> failwith "Communication impossible vers le serveur reçue"
@@ -529,7 +541,7 @@ module Th: S = struct
               aux q
             with
               Not_found -> failwith "Tentative de communication avec un client inexistant"
-             |_ -> failwith "Une erreur est survenue lors de l'envoi des données"
+             |_ -> failwith "Une erreur est survenue lors de l'envoi des donnees"
     in      
     waiting_for_data := aux (!waiting_for_data)
 
@@ -563,7 +575,7 @@ module Th: S = struct
   let rec start first_process = match first_process with
     |None -> None
     |Some p  -> let c = find_minimal_client () in
-                if c= -1 then Some p
+                if c= -1 then (Unix.sleep 1; Some p)
                 else
                   begin
                     incr_load c;
@@ -590,17 +602,12 @@ module Th: S = struct
     
 
 
-  let run p =
-    let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM (!port) in
+  let run ?port:(port=1042) p =
+    let socket = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
     Unix.set_nonblock socket;
-    Unix.bind socket (Unix.ADDR_INET (Unix.inet_addr_any,!port));
+    Unix.bind socket (Unix.ADDR_INET (Unix.inet_addr_any,port));
     Unix.listen socket 10;
     p.id <- 0;
     server_routine socket (Some p) ()
-    
-    
-    
-
-
-            
+          
 end
