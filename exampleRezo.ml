@@ -17,22 +17,9 @@ module Example (K : Rezo.S) = struct
     in
     loop ()
 
-  let maina : unit K.process =
-    let p1 qo =Lib.delay (fun () -> Unix.sleep 10; print_endline "je donne"; ()) () >>= fun () -> K.put 5 qo in
-    let p2 qi= Lib.delay (fun () -> print_endline "je cherche"; ()) () >>= fun () -> K.get qi >>= fun v -> print_int v; K.return () in
-    K.new_channel () >>= (fun (qi,qo) -> K.doco [ p2 qi; p1 qo;])
-    
-  let mainz : unit K.process =
-    let p1 qo =Lib.delay (fun () -> Unix.sleep 10; print_endline "je donne"; ()) () >>= fun () -> K.put 5 qo in
-    let p2 qi= Lib.delay (fun () -> print_endline "je cherche"; ()) () >>= fun () -> K.get qi >>= fun v -> print_int v; K.return () in
-    K.new_channel () >>= (fun (qi,qo) -> K.doco [p1 qo;p2 qi;])
-
   let main : unit K.process =
     K.new_channel () >>=
       (fun (q_in, q_out) -> K.doco [ integers q_out ; output q_in ; ])
-
-  let maine : unit K.process =
-    Lib.delay (fun () -> print_endline "je m'execute"; Unix.sleep 1; ()) ()
 
 end
 
